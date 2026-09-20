@@ -1,327 +1,559 @@
 import os
-import uuid
 import time
+import uuid
 import asyncio
 from pathlib import Path
+from typing import Optional
 
 import torch
 import soundfile as sf
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 from voxcpm import VoxCPM
 
 
 # ============================================================
-# CONFIG
+# VoxCPM2 Kaggle API Server
 # ============================================================
 
-HOST = "0.0.0.0"
-PORT = int(os.getenv("PORT", "8000"))
+APP_NAME = "VoxCPM2 Telegram Voice API"
 
-API_KEY = os.getenv("VOX_API_KEY", "CHANGE_THIS_KEY")
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
 
 VOICE_DIR = Path(
     "/kaggle/input/datasets/ohmyqueenmedusa/pyaesonevvipvoice"
 )
 
-VOICES = {
-    "Phyo": VOICE_DIR / "Phyo_vvipvoice.wav",
-    "Htun": VOICE_DIR / "Htun_vvipvoice.wav",
-    "Pyae": VOICE_DIR / "Pyae_vvipvoice.wav",
-    "Fangyung": VOICE_DIR / "Fangyung_vvipvoice.wav",
-}
-
-OUTPUT_DIR = Path("/kaggle/working/outputs")
+OUTPUT_DIR = Path("/kaggle/working/voxcpm_outputs")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# API key
+# IMPORTANT:
+# Change this to a strong random secret.
+API_KEY = os.getenv(
+    "VOXCPM_API_KEY",
+    "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET"
+)
 
-# ============================================================
-# VOXCPM SETTINGS
-# ============================================================
+# Maximum text length
+MAX_TEXT_LENGTH = 2000
 
+# VoxCPM2 generation settings
 CFG_VALUE = 2.0
 INFERENCE_TIMESTEPS = 30
-MAX_LEN = 2000
 RETRY_BADCASE = False
+MAX_LEN = 2000
 
 
-# ============================================================
-# APP
-# ============================================================
+# ------------------------------------------------------------
+# Voice references
+# ------------------------------------------------------------
+
+VOICES = {
+    "Fangyung": VOICE_DIR / "Fangyung_vvipvoice.wav",
+    "Htun": VOICE_DIR / "Htun_vvipvoice.wav",
+    "Phyo": VOICE_DIR / "Phyo_vvipvoice.wav",
+    "Pyae": VOICE_DIR / "Pyae_vvipvoice.wav",
+}
+
+
+# ------------------------------------------------------------
+# FastAPI
+# ------------------------------------------------------------
 
 app = FastAPI(
-    title="VoxCPM2 Telegram GPU API",
-    version="1.0.0"
+    title=APP_NAME,
+    version="1.0.0",
 )
 
 
-model = None
-model_lock = asyncio.Lock()
+# ------------------------------------------------------------
+# Model
+# ------------------------------------------------------------
+
+model: Optional[VoxCPM] = None
+
+# Prevent multiple GPU inference jobs running at the same time.
+generation_lock = asyncio.Lock()
 
 
-# ============================================================
-# REQUEST MODEL
-# ============================================================
+# ------------------------------------------------------------
+# Request model
+# ------------------------------------------------------------
 
 class GenerateRequest(BaseModel):
-    text: str
-    voice: str
+    voice: str = Field(..., description="Voice name")
+    text: str = Field(..., min_length=1, max_length=2000)
 
 
-# ============================================================
-# LOAD MODEL ONLY WHEN NEEDED
-# ============================================================
+# ------------------------------------------------------------
+# Startup
+# ------------------------------------------------------------
 
-async def get_model():
+@app.on_event("startup")
+async def startup_event():
+
+    print("=" * 70)
+    print("🚀 VoxCPM2 Telegram Voice API")
+    print("=" * 70)
+
+    print("\n🔍 Checking CUDA...")
+
+    if not torch.cuda.is_available():
+        print("❌ CUDA is NOT available.")
+        raise RuntimeError(
+            "CUDA GPU is required for VoxCPM2."
+        )
+
+    print("✅ CUDA:", torch.cuda.is_available())
+    print("✅ GPU:", torch.cuda.get_device_name(0))
+
+    print("\n🎙️ Checking voice files...")
+
+    for name, path in VOICES.items():
+
+        if path.exists():
+            print(f"✅ {name:10} -> {path}")
+        else:
+            print(f"❌ {name:10} -> {path}")
+
+    print("\n✅ API server started.")
+    print("ℹ️ VoxCPM2 model will load on first /generate request.")
+    print("=" * 70)
+
+
+# ------------------------------------------------------------
+# Load model
+# ------------------------------------------------------------
+
+def load_model():
 
     global model
 
     if model is not None:
         return model
 
-    async with model_lock:
+    print("\n" + "=" * 70)
+    print("🚀 Loading VoxCPM2...")
+    print("=" * 70)
 
-        if model is not None:
-            return model
+    model = VoxCPM.from_pretrained(
+        "openbmb/VoxCPM2",
+        load_denoiser=False,
+        device="cuda",
+        optimize=True,
+    )
 
-        print("========================================")
-        print("🚀 Loading VoxCPM2")
-        print("========================================")
-        print(f"PyTorch : {torch.__version__}")
-        print(f"CUDA    : {torch.cuda.is_available()}")
+    print("\n✅ VoxCPM2 loaded!")
 
-        if torch.cuda.is_available():
-            print(f"GPU     : {torch.cuda.get_device_name(0)}")
+    print(
+        "Sample rate:",
+        model.tts_model.sample_rate
+    )
 
-        print(f"Device  : {DEVICE}")
+    if torch.cuda.is_available():
 
-        model = VoxCPM.from_pretrained(
-            "openbmb/VoxCPM2",
-            device=DEVICE
+        print(
+            "GPU memory allocated:",
+            round(
+                torch.cuda.memory_allocated() / 1024**3,
+                2
+            ),
+            "GB"
         )
 
-        print("✅ VoxCPM2 loaded")
+    print("=" * 70)
 
-        return model
+    return model
 
 
-# ============================================================
-# AUTH
-# ============================================================
+# ------------------------------------------------------------
+# API key validation
+# ------------------------------------------------------------
 
-def check_key(key: str):
+def check_api_key(
+    authorization: Optional[str],
+    x_api_key: Optional[str],
+):
 
-    if key != API_KEY:
+    # Accept:
+    #
+    # Authorization: Bearer YOUR_KEY
+    #
+    # OR
+    #
+    # X-API-Key: YOUR_KEY
+
+    provided_key = None
+
+    if authorization:
+
+        if authorization.startswith("Bearer "):
+            provided_key = authorization[7:].strip()
+
+    if not provided_key and x_api_key:
+        provided_key = x_api_key.strip()
+
+    if not provided_key:
         raise HTTPException(
             status_code=401,
-            detail="Invalid API key"
+            detail="Missing API key."
+        )
+
+    if provided_key != API_KEY:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid API key."
         )
 
 
-# ============================================================
-# HEALTH
-# ============================================================
+# ------------------------------------------------------------
+# Root
+# ------------------------------------------------------------
 
 @app.get("/")
 async def root():
 
     return {
         "status": "online",
-        "service": "VoxCPM2 GPU API",
+        "service": APP_NAME,
+        "version": "1.0.0",
+        "cuda": torch.cuda.is_available(),
         "gpu": (
             torch.cuda.get_device_name(0)
             if torch.cuda.is_available()
-            else "CPU"
+            else None
         ),
-        "cuda": torch.cuda.is_available(),
-        "model_loaded": model is not None,
+        "voices": list(VOICES.keys()),
+        "max_text_length": MAX_TEXT_LENGTH,
+        "inference_timesteps": INFERENCE_TIMESTEPS,
     }
 
+
+# ------------------------------------------------------------
+# Health check
+# ------------------------------------------------------------
+
+@app.get("/health")
+async def health():
+
+    return {
+        "status": "healthy",
+        "model_loaded": model is not None,
+        "cuda": torch.cuda.is_available(),
+        "gpu": (
+            torch.cuda.get_device_name(0)
+            if torch.cuda.is_available()
+            else None
+        ),
+    }
+
+
+# ------------------------------------------------------------
+# Voices
+# ------------------------------------------------------------
 
 @app.get("/voices")
 async def voices():
 
     return {
-        "voices": list(VOICES.keys())
+        "voices": [
+            {
+                "name": name,
+                "available": path.exists(),
+            }
+            for name, path in VOICES.items()
+        ]
     }
 
 
-# ============================================================
-# GENERATE
-# ============================================================
+# ------------------------------------------------------------
+# Generate
+# ------------------------------------------------------------
 
 @app.post("/generate")
 async def generate(
-    request: GenerateRequest
+    request: GenerateRequest,
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None),
 ):
 
-    start_time = time.time()
+    # --------------------------------------------------------
+    # Authentication
+    # --------------------------------------------------------
 
-    check_key(API_KEY)
+    check_api_key(
+        authorization,
+        x_api_key,
+    )
 
-    text = request.text.strip()
-    voice = request.voice.strip()
+    # --------------------------------------------------------
+    # Validate voice
+    # --------------------------------------------------------
 
-    if not text:
-        raise HTTPException(
-            status_code=400,
-            detail="Text is empty"
-        )
+    voice_name = request.voice.strip()
 
-    if len(text) > MAX_LEN:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Maximum {MAX_LEN} characters allowed"
-        )
+    if voice_name not in VOICES:
 
-    if voice not in VOICES:
         raise HTTPException(
             status_code=400,
             detail={
-                "error": "Unknown voice",
-                "available": list(VOICES.keys())
-            }
+                "error": "Unknown voice.",
+                "available_voices": list(VOICES.keys()),
+            },
         )
 
-    reference = VOICES[voice]
+    reference = VOICES[voice_name]
 
     if not reference.exists():
+
         raise HTTPException(
             status_code=500,
-            detail=f"Reference voice missing: {reference}"
+            detail=f"Reference voice not found: {reference}",
         )
 
-    print("----------------------------------------")
-    print("🎙 NEW TTS REQUEST")
-    print(f"Voice      : {voice}")
-    print(f"Characters : {len(text)}")
-    print(f"Steps      : {INFERENCE_TIMESTEPS}")
-    print("----------------------------------------")
-
     # --------------------------------------------------------
-    # Load model only after actual Telegram request
+    # Validate text
     # --------------------------------------------------------
 
-    t0 = time.time()
+    text = request.text.strip()
 
-    tts = await get_model()
+    if not text:
 
-    model_load_time = time.time() - t0
+        raise HTTPException(
+            status_code=400,
+            detail="Text cannot be empty.",
+        )
+
+    if len(text) > MAX_TEXT_LENGTH:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Text is too long. "
+                f"Maximum is {MAX_TEXT_LENGTH} characters."
+            ),
+        )
 
     # --------------------------------------------------------
-    # GPU inference
+    # Queue GPU generation
     # --------------------------------------------------------
 
-    t1 = time.time()
+    async with generation_lock:
 
-    try:
+        generation_id = uuid.uuid4().hex
 
-        with torch.inference_mode():
+        output_file = (
+            OUTPUT_DIR
+            / f"{voice_name}_{generation_id}.wav"
+        )
 
-            wav = tts.generate(
+        print("\n" + "=" * 70)
+        print("🎙️ NEW GENERATION")
+        print("=" * 70)
+
+        print("Voice:", voice_name)
+        print("Text length:", len(text))
+        print("Reference:", reference)
+        print("Output:", output_file)
+
+        print("\n⚙️ Settings")
+        print("CFG:", CFG_VALUE)
+        print("Inference steps:", INFERENCE_TIMESTEPS)
+        print("Retry badcase:", RETRY_BADCASE)
+        print("Max length:", MAX_LEN)
+
+        # ----------------------------------------------------
+        # Load model only when needed
+        # ----------------------------------------------------
+
+        tts_model = load_model()
+
+        # ----------------------------------------------------
+        # GPU inference
+        # ----------------------------------------------------
+
+        print("\n🚀 Generating...")
+
+        start = time.perf_counter()
+
+        try:
+
+            wav = tts_model.generate(
                 text=text,
-
                 reference_wav_path=str(reference),
 
+                # Keep user's tested settings
                 cfg_value=CFG_VALUE,
-
                 inference_timesteps=INFERENCE_TIMESTEPS,
-
                 retry_badcase=RETRY_BADCASE,
-
                 max_len=MAX_LEN,
             )
 
-    except Exception as e:
+        except Exception as e:
 
-        print("❌ GENERATION ERROR")
-        print(repr(e))
+            print("\n❌ Generation error:")
+            print(repr(e))
 
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
+            if output_file.exists():
+                try:
+                    output_file.unlink()
+                except Exception:
+                    pass
+
+            raise HTTPException(
+                status_code=500,
+                detail=f"Voice generation failed: {str(e)}",
+            )
+
+        elapsed = time.perf_counter() - start
+
+        # ----------------------------------------------------
+        # Save WAV
+        # ----------------------------------------------------
+
+        try:
+
+            sf.write(
+                str(output_file),
+                wav,
+                tts_model.tts_model.sample_rate,
+            )
+
+        except Exception as e:
+
+            print("\n❌ WAV save error:")
+            print(repr(e))
+
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to save WAV: {str(e)}",
+            )
+
+        # ----------------------------------------------------
+        # Calculate statistics
+        # ----------------------------------------------------
+
+        sample_rate = tts_model.tts_model.sample_rate
+
+        duration = (
+            len(wav) / sample_rate
         )
 
-    inference_time = time.time() - t1
+        rtf = (
+            elapsed / duration
+            if duration > 0
+            else 0
+        )
 
-    # --------------------------------------------------------
-    # Save WAV
-    # --------------------------------------------------------
+        vram = None
 
-    filename = (
-        f"{uuid.uuid4().hex}.wav"
-    )
+        if torch.cuda.is_available():
 
-    output_path = OUTPUT_DIR / filename
+            vram = round(
+                torch.cuda.memory_allocated() / 1024**3,
+                2
+            )
 
-    sf.write(
-        output_path,
-        wav,
-        tts.tts_model.sample_rate
-    )
+        print("\n" + "=" * 70)
+        print("✅ GENERATION COMPLETE")
+        print("=" * 70)
 
-    total_time = time.time() - start_time
+        print("Voice:", voice_name)
+        print("Duration:", round(duration, 2), "sec")
+        print("Generation:", round(elapsed, 2), "sec")
+        print("RTF:", round(rtf, 3))
 
-    print("----------------------------------------")
-    print("✅ GENERATION COMPLETE")
-    print(f"Model load : {model_load_time:.2f}s")
-    print(f"Inference  : {inference_time:.2f}s")
-    print(f"Total      : {total_time:.2f}s")
-    print(f"Output     : {output_path}")
-    print("----------------------------------------")
+        if vram is not None:
+            print("VRAM:", vram, "GB")
 
-    return {
-        "success": True,
-        "voice": voice,
-        "characters": len(text),
-        "steps": INFERENCE_TIMESTEPS,
-        "cfg": CFG_VALUE,
-        "max_len": MAX_LEN,
-        "inference_time": round(inference_time, 2),
-        "total_time": round(total_time, 2),
-        "file": str(output_path),
-        "filename": filename,
-    }
+        print("File:", output_file)
+
+        print("=" * 70)
+
+        # ----------------------------------------------------
+        # Return metadata + download URL
+        # ----------------------------------------------------
+
+        return {
+            "success": True,
+            "generation_id": generation_id,
+            "voice": voice_name,
+            "duration": round(duration, 2),
+            "generation_time": round(elapsed, 2),
+            "rtf": round(rtf, 3),
+            "sample_rate": sample_rate,
+            "vram_gb": vram,
+            "filename": output_file.name,
+            "download_url": (
+                f"/audio/{output_file.name}"
+            ),
+        }
 
 
-# ============================================================
-# FILE DOWNLOAD
-# ============================================================
-
-from fastapi.responses import FileResponse
-
+# ------------------------------------------------------------
+# Audio download
+# ------------------------------------------------------------
 
 @app.get("/audio/{filename}")
-async def audio(filename: str):
+async def audio(
+    filename: str,
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None),
+):
 
-    file_path = OUTPUT_DIR / filename
+    # Authentication
+    check_api_key(
+        authorization,
+        x_api_key,
+    )
+
+    # Security:
+    # Only allow the filename itself.
+    safe_name = Path(filename).name
+
+    if safe_name != filename:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid filename.",
+        )
+
+    file_path = OUTPUT_DIR / safe_name
 
     if not file_path.exists():
+
         raise HTTPException(
             status_code=404,
-            detail="Audio not found"
+            detail="Audio file not found.",
         )
 
     return FileResponse(
-        path=file_path,
+        path=str(file_path),
         media_type="audio/wav",
-        filename=filename
+        filename=safe_name,
     )
 
 
-# ============================================================
-# START
-# ============================================================
+# ------------------------------------------------------------
+# Run server
+# ------------------------------------------------------------
 
 if __name__ == "__main__":
 
     import uvicorn
 
+    print("\n🚀 Starting FastAPI server...")
+    print("Host: 0.0.0.0")
+    print("Port: 8000")
+
     uvicorn.run(
         app,
-        host=HOST,
-        port=PORT
+        host="0.0.0.0",
+        port=8000,
+        log_level="info",
     )
