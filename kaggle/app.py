@@ -36,7 +36,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # Change this to a strong random secret.
 API_KEY = os.getenv(
     "VOXCPM_API_KEY",
-    "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET"
+    "Pyaesonevvipvoice"
 )
 
 # Maximum text length
