@@ -145,7 +145,7 @@ def load_model():
         "openbmb/VoxCPM2",
         load_denoiser=False,
         device="cuda",
-        optimize=True,
+        optimize=False,
     )
 
     print("\n✅ VoxCPM2 loaded!")
