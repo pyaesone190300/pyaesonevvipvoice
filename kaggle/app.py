@@ -144,7 +144,7 @@ def load_model():
     model = VoxCPM.from_pretrained(
         "openbmb/VoxCPM2",
         load_denoiser=False,
-        device="cuda",
+        device="cuda:1",
         optimize=True,
     )
 
