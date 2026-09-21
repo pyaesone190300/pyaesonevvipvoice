@@ -3,7 +3,7 @@ import time
 import uuid
 import asyncio
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import torch
 import soundfile as sf
@@ -79,6 +79,11 @@ model: Optional[VoxCPM] = None
 
 # Prevent multiple GPU inference jobs running at the same time.
 generation_lock = asyncio.Lock()
+
+# Background generation jobs.
+# /generate returns immediately with a job_id so Cloudflare does not
+# have to keep the HTTP request open during long VoxCPM2 inference.
+jobs: Dict[str, Dict[str, Any]] = {}
 
 
 # ------------------------------------------------------------
@@ -281,24 +286,10 @@ async def generate(
     authorization: Optional[str] = Header(default=None),
     x_api_key: Optional[str] = Header(default=None),
 ):
-
-    # --------------------------------------------------------
-    # Authentication
-    # --------------------------------------------------------
-
-    check_api_key(
-        authorization,
-        x_api_key,
-    )
-
-    # --------------------------------------------------------
-    # Validate voice
-    # --------------------------------------------------------
+    check_api_key(authorization, x_api_key)
 
     voice_name = request.voice.strip()
-
     if voice_name not in VOICES:
-
         raise HTTPException(
             status_code=400,
             detail={
@@ -308,191 +299,177 @@ async def generate(
         )
 
     reference = VOICES[voice_name]
-
     if not reference.exists():
-
         raise HTTPException(
             status_code=500,
             detail=f"Reference voice not found: {reference}",
         )
 
-    # --------------------------------------------------------
-    # Validate text
-    # --------------------------------------------------------
-
     text = request.text.strip()
-
     if not text:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Text cannot be empty.",
-        )
+        raise HTTPException(status_code=400, detail="Text cannot be empty.")
 
     if len(text) > MAX_TEXT_LENGTH:
-
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Text is too long. "
-                f"Maximum is {MAX_TEXT_LENGTH} characters."
-            ),
+            detail=f"Text is too long. Maximum is {MAX_TEXT_LENGTH} characters.",
         )
 
-    # --------------------------------------------------------
-    # Queue GPU generation
-    # --------------------------------------------------------
+    generation_id = uuid.uuid4().hex
+    jobs[generation_id] = {
+        "status": "queued",
+        "generation_id": generation_id,
+        "voice": voice_name,
+        "filename": None,
+        "download_url": None,
+        "duration": None,
+        "generation_time": None,
+        "rtf": None,
+        "sample_rate": None,
+        "vram_gb": None,
+        "error": None,
+    }
+
+    print("\\n" + "=" * 70)
+    print("📝 NEW GENERATION JOB")
+    print("=" * 70)
+    print("Job ID:", generation_id)
+    print("Voice:", voice_name)
+    print("Text length:", len(text))
+    print("Reference:", reference)
+    print("=" * 70)
+
+    asyncio.create_task(
+        run_generation_job(
+            generation_id=generation_id,
+            voice_name=voice_name,
+            text=text,
+            reference=reference,
+        )
+    )
+
+    return {
+        "success": True,
+        "status": "queued",
+        "generation_id": generation_id,
+        "status_url": f"/status/{generation_id}",
+    }
+
+
+async def run_generation_job(
+    generation_id: str,
+    voice_name: str,
+    text: str,
+    reference: Path,
+):
+    job = jobs.get(generation_id)
+    if job is None:
+        return
 
     async with generation_lock:
+        job["status"] = "generating"
+        output_file = OUTPUT_DIR / f"{voice_name}_{generation_id}.wav"
 
-        generation_id = uuid.uuid4().hex
-
-        output_file = (
-            OUTPUT_DIR
-            / f"{voice_name}_{generation_id}.wav"
-        )
-
-        print("\n" + "=" * 70)
-        print("🎙️ NEW GENERATION")
+        print("\\n" + "=" * 70)
+        print("🎙️ GENERATION STARTED")
         print("=" * 70)
-
+        print("Job ID:", generation_id)
         print("Voice:", voice_name)
         print("Text length:", len(text))
         print("Reference:", reference)
         print("Output:", output_file)
-
-        print("\n⚙️ Settings")
+        print("\\n⚙️ Settings")
         print("CFG:", CFG_VALUE)
         print("Inference steps:", INFERENCE_TIMESTEPS)
         print("Retry badcase:", RETRY_BADCASE)
         print("Max length:", MAX_LEN)
 
-        # ----------------------------------------------------
-        # Load model only when needed
-        # ----------------------------------------------------
-
-        tts_model = load_model()
-
-        # ----------------------------------------------------
-        # GPU inference
-        # ----------------------------------------------------
-
-        print("\n🚀 Generating...")
-
-        start = time.perf_counter()
-
         try:
+            tts_model = await asyncio.to_thread(load_model)
+            print("\\n🚀 Generating...")
+            start_time = time.perf_counter()
 
-            wav = tts_model.generate(
+            wav = await asyncio.to_thread(
+                tts_model.generate,
                 text=text,
                 reference_wav_path=str(reference),
-
-                # Keep user's tested settings
                 cfg_value=CFG_VALUE,
                 inference_timesteps=INFERENCE_TIMESTEPS,
                 retry_badcase=RETRY_BADCASE,
                 max_len=MAX_LEN,
             )
 
-        except Exception as e:
+            elapsed = time.perf_counter() - start_time
 
-            print("\n❌ Generation error:")
-            print(repr(e))
-
-            if output_file.exists():
-                try:
-                    output_file.unlink()
-                except Exception:
-                    pass
-
-            raise HTTPException(
-                status_code=500,
-                detail=f"Voice generation failed: {str(e)}",
-            )
-
-        elapsed = time.perf_counter() - start
-
-        # ----------------------------------------------------
-        # Save WAV
-        # ----------------------------------------------------
-
-        try:
-
-            sf.write(
+            await asyncio.to_thread(
+                sf.write,
                 str(output_file),
                 wav,
                 tts_model.tts_model.sample_rate,
             )
 
+            sample_rate = tts_model.tts_model.sample_rate
+            duration = len(wav) / sample_rate
+            rtf = elapsed / duration if duration > 0 else 0
+            vram = None
+            if torch.cuda.is_available():
+                vram = round(torch.cuda.memory_allocated() / 1024**3, 2)
+
+            job.update({
+                "status": "completed",
+                "filename": output_file.name,
+                "download_url": f"/audio/{output_file.name}",
+                "duration": round(duration, 2),
+                "generation_time": round(elapsed, 2),
+                "rtf": round(rtf, 3),
+                "sample_rate": sample_rate,
+                "vram_gb": vram,
+                "error": None,
+            })
+
+            print("\\n" + "=" * 70)
+            print("✅ GENERATION COMPLETE")
+            print("=" * 70)
+            print("Job ID:", generation_id)
+            print("Voice:", voice_name)
+            print("Duration:", round(duration, 2), "sec")
+            print("Generation:", round(elapsed, 2), "sec")
+            print("RTF:", round(rtf, 3))
+            if vram is not None:
+                print("VRAM:", vram, "GB")
+            print("File:", output_file)
+            print("=" * 70)
+
         except Exception as e:
-
-            print("\n❌ WAV save error:")
+            print("\\n" + "=" * 70)
+            print("❌ GENERATION ERROR")
+            print("=" * 70)
+            print("Job ID:", generation_id)
             print(repr(e))
+            print("=" * 70)
+            if output_file.exists():
+                try:
+                    output_file.unlink()
+                except Exception:
+                    pass
+            job.update({"status": "failed", "error": str(e)})
 
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to save WAV: {str(e)}",
-            )
 
-        # ----------------------------------------------------
-        # Calculate statistics
-        # ----------------------------------------------------
+# ------------------------------------------------------------
+# Generation job status
+# ------------------------------------------------------------
 
-        sample_rate = tts_model.tts_model.sample_rate
-
-        duration = (
-            len(wav) / sample_rate
-        )
-
-        rtf = (
-            elapsed / duration
-            if duration > 0
-            else 0
-        )
-
-        vram = None
-
-        if torch.cuda.is_available():
-
-            vram = round(
-                torch.cuda.memory_allocated() / 1024**3,
-                2
-            )
-
-        print("\n" + "=" * 70)
-        print("✅ GENERATION COMPLETE")
-        print("=" * 70)
-
-        print("Voice:", voice_name)
-        print("Duration:", round(duration, 2), "sec")
-        print("Generation:", round(elapsed, 2), "sec")
-        print("RTF:", round(rtf, 3))
-
-        if vram is not None:
-            print("VRAM:", vram, "GB")
-
-        print("File:", output_file)
-
-        print("=" * 70)
-
-        # ----------------------------------------------------
-        # Return metadata + download URL
-        # ----------------------------------------------------
-
-        return {
-            "success": True,
-            "generation_id": generation_id,
-            "voice": voice_name,
-            "duration": round(duration, 2),
-            "generation_time": round(elapsed, 2),
-            "rtf": round(rtf, 3),
-            "sample_rate": sample_rate,
-            "vram_gb": vram,
-            "filename": output_file.name,
-            "download_url": (
-                f"/audio/{output_file.name}"
-            ),
-        }
+@app.get("/status/{generation_id}")
+async def generation_status(
+    generation_id: str,
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    check_api_key(authorization, x_api_key)
+    job = jobs.get(generation_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Generation job not found.")
+    return {"success": job["status"] != "failed", **job}
 
 
 # ------------------------------------------------------------
